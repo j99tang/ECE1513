@@ -1,0 +1,17 @@
+# ──────────────────────────────────────────────────────────────────────
+# IEC 104 SCADA Intrusion Detection System — SVM Implementation
+# Python package requirements
+# ──────────────────────────────────────────────────────────────────────
+
+# Core ML / data stack
+scikit-learn>=1.3.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualisation
+matplotlib>=3.7.0
+seaborn>=0.13.0
+
+# Notebook support (needed only for demo_notebook.ipynb)
+jupyter>=1.0.0
+ipykernel>=6.25.0
