@@ -39,7 +39,7 @@ OUTPUTS:
     • Each figure is annotated in code with a "REPORT USAGE" comment
       explaining what it shows and how to discuss it in a write-up.
 
-Author : [Your Name]
+Author : Jake Shi
 Date   : 2026
 ================================================================================
 """
@@ -75,7 +75,16 @@ from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.decomposition import PCA
 
 warnings.filterwarnings("ignore")
-np.random.seed(42)
+
+# ── Multiple seeds for robust evaluation ─────────────────────────────────
+# Instead of a single random_state, we run the full pipeline with multiple
+# seeds and report the AVERAGE metrics across all runs.  This reduces the
+# effect of a single lucky/unlucky train/test split and gives more reliable
+# performance estimates.
+SEEDS = [42, 123, 256, 789, 1024]
+N_SEEDS = len(SEEDS)
+
+np.random.seed(42)  # for reproducible EDA / figure generation
 
 # ── Global plot style — clean, academic-friendly ─────────────────────────
 sns.set_style("whitegrid")
@@ -278,31 +287,21 @@ X = X.fillna(X.median())
 print(f"  Replaced {nan_count:,} inf/NaN cells with column medians")
 print(f"  Final feature matrix : {X.shape[0]:,} samples x {X.shape[1]} features")
 
-# Step 3e: Stratified train/test split (75% train / 25% test).
-# Stratification ensures that each class appears in training and test
-# sets with the same proportions as the full dataset — essential when
-# the smallest class has only 26 samples.
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.25, random_state=42, stratify=y
-)
-print(f"  Training set : {X_train.shape[0]:,} samples  (75%)")
-print(f"  Test set     : {X_test.shape[0]:,} samples  (25%)")
+# Step 3e: Stratified train/test split and training are performed inside
+# the multi-seed loop below.  We run the full 3-phase pipeline with
+# multiple different random seeds and average the results for robustness.
 
 
 ###############################################################################
 #                                                                             #
-#   HELPER FUNCTION — Evaluate, Print, and Store Results                     #
+#   HELPER FUNCTION — Evaluate and Return Metrics                            #
 #                                                                             #
 ###############################################################################
 
-# Dictionary to collect results from all three phases for later comparison
-results = {}
-
-def evaluate(model, Xtr, Xte, ytr, yte, name):
+def evaluate(model, Xtr, Xte, ytr, yte, name, seed_num=None):
     """
     Train a model, predict on the held-out test set, print all evaluation
-    metrics and a full classification report, then store the results
-    dictionary for cross-phase comparison and visualisation.
+    metrics and a full classification report, then return the metrics dict.
 
     Parameters
     ----------
@@ -310,10 +309,12 @@ def evaluate(model, Xtr, Xte, ytr, yte, name):
     Xtr, Xte  : array-like    – training / test feature matrices
     ytr, yte   : array-like    – training / test targets
     name       : str           – display name for this phase
+    seed_num   : int or None   – current seed index for display
 
     Returns
     -------
-    y_pred : np.ndarray – predictions on the test set
+    metrics : dict  – accuracy, f1_weighted, f1_macro, precision, recall, time
+    y_pred  : np.ndarray – predictions on the test set
     """
     t0 = time.time()
     model.fit(Xtr, ytr)
@@ -329,8 +330,9 @@ def evaluate(model, Xtr, Xte, ytr, yte, name):
     rec  = recall_score(yte, y_pred, average="weighted", zero_division=0)
 
     # Pretty-print summary
+    seed_label = f" [seed {seed_num}]" if seed_num is not None else ""
     print(f"\n  {'─' * 50}")
-    print(f"  {name}")
+    print(f"  {name}{seed_label}")
     print(f"  {'─' * 50}")
     print(f"    Accuracy              {acc:.4f}")
     print(f"    F1 Score (weighted)   {f1w:.4f}")
@@ -346,152 +348,248 @@ def evaluate(model, Xtr, Xte, ytr, yte, name):
         yte, y_pred, target_names=le.classes_, zero_division=0
     ))
 
-    # Store for later comparison
-    results[name] = dict(
+    metrics = dict(
         accuracy=acc, f1_weighted=f1w, f1_macro=f1m,
         precision=prec, recall=rec, time=elapsed,
-        y_pred=y_pred,
     )
-    return y_pred
+    return metrics, y_pred
 
 
 ###############################################################################
 #                                                                             #
-#   SECTION 4 — PHASE 1: BASELINE SVM                                        #
+#   SECTIONS 4–6 — MULTI-SEED TRAINING LOOP                                  #
 #                                                                             #
-#   Configuration:                                                            #
-#     • Kernel       : linear                                                #
-#     • C            : 1.0 (sklearn default)                                 #
-#     • Scaling      : none                                                  #
-#     • Class weights: none (uniform)                                        #
+#   We run the full 3-phase pipeline (Baseline → Improved → Optimized)       #
+#   with each seed in SEEDS.  Each seed produces a different stratified       #
+#   train/test split, so the final reported metrics are the AVERAGE across   #
+#   all runs — giving a more robust and honest performance estimate than     #
+#   a single lucky split.                                                    #
 #                                                                             #
-#   RATIONALE:                                                                #
-#     This is the simplest possible SVM — deliberately suboptimal so we      #
-#     can measure how much each subsequent improvement contributes.           #
+#   The predictions and objects from the LAST seed are kept for generating   #
+#   the report figures (confusion matrices, PCA scatter, etc.).              #
 #                                                                             #
-#   EXPECTED WEAKNESSES:                                                      #
-#     1. No feature scaling — SVM finds the maximum-margin hyperplane by     #
-#        computing dot products between feature vectors.  Without scaling,   #
-#        features with large numeric ranges (e.g., Flow Bytes/s ~ 10^7)      #
-#        dominate the geometry over features with small ranges (e.g., flag   #
-#        counts ~ 0/1).  The margin is distorted in favour of high-range     #
-#        dimensions.                                                         #
-#     2. Linear kernel — assumes the classes can be separated by a flat      #
-#        hyperplane.  Network traffic patterns are typically non-linear.     #
-#     3. No class balancing — with portscan at 63% of data, the model       #
-#        can achieve ~63% accuracy by always predicting portscan.  Rare     #
-#        classes like MITM (0.2%) and flood (0.7%) are effectively ignored. #
+###############################################################################
+
+# Collect per-seed metrics for each phase
+all_run_metrics = {
+    "Phase 1: Baseline":  [],
+    "Phase 2: Improved":  [],
+    "Phase 3: Optimized": [],
+}
+
+# These will hold the last run's objects for figure generation
+pred_p1 = pred_p2 = pred_p3 = None
+y_test = None
+X_test_sel = None
+best_model = None
+grid = None
+selected_names = None
+selected_scores = None
+selected_mask = None
+
+for run_idx, seed in enumerate(SEEDS):
+
+    print("\n" + "#" * 72)
+    print(f"  RUN {run_idx + 1}/{N_SEEDS}  —  seed = {seed}")
+    print("#" * 72)
+
+    # ── Train/test split with this seed ──────────────────────────────────
+    X_train, X_test_run, y_train, y_test_run = train_test_split(
+        X, y, test_size=0.25, random_state=seed, stratify=y
+    )
+    print(f"  Training set : {X_train.shape[0]:,} samples  (75%)")
+    print(f"  Test set     : {X_test_run.shape[0]:,} samples  (25%)")
+
+    # ════════════════════════════════════════════════════════════════════
+    # PHASE 1 — BASELINE SVM
+    #   Linear kernel, C=1.0 (default), raw features, no scaling,
+    #   no class balancing.  Deliberately suboptimal to set the floor.
+    #
+    #   EXPECTED WEAKNESSES:
+    #     1. No feature scaling — high-range features dominate
+    #     2. Linear kernel — cannot capture non-linear boundaries
+    #     3. No class balancing — minority classes ignored
+    # ════════════════════════════════════════════════════════════════════
+    print(f"\n  PHASE 1 — BASELINE SVM (seed={seed})")
+
+    svm_baseline = SVC(kernel="linear", C=1.0, random_state=seed, max_iter=10000)
+    m1, pred1 = evaluate(svm_baseline, X_train, X_test_run, y_train, y_test_run,
+                         "Phase 1: Baseline", seed)
+    all_run_metrics["Phase 1: Baseline"].append(m1)
+
+    # ════════════════════════════════════════════════════════════════════
+    # PHASE 2 — IMPROVED SVM
+    #   + StandardScaler normalisation (zero-mean, unit-variance)
+    #   + ANOVA F-test feature selection (top 30 features)
+    #   + RBF kernel (non-linear decision boundaries)
+    #   + class_weight='balanced' (up-weight minority classes)
+    #
+    #   Each improvement addresses a specific Phase-1 weakness:
+    #     StandardScaler  → feature magnitude imbalance
+    #     ANOVA selection → high dimensionality / redundancy
+    #     RBF kernel      → non-linear class boundaries
+    #     balanced weight → class imbalance
+    # ════════════════════════════════════════════════════════════════════
+    print(f"\n  PHASE 2 — IMPROVED SVM (seed={seed})")
+
+    # Feature Scaling
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_test_sc  = scaler.transform(X_test_run)
+
+    # Feature Selection
+    selector = SelectKBest(f_classif, k=30)
+    X_train_sel = selector.fit_transform(X_train_sc, y_train)
+    X_test_sel_run = selector.transform(X_test_sc)
+
+    # Record selected features (from last run, for figures)
+    selected_mask_run   = selector.get_support()
+    selected_names_run  = X.columns[selected_mask_run].tolist()
+    selected_scores_run = selector.scores_[selected_mask_run]
+
+    print(f"  Selected top 30 features by ANOVA F-score:")
+    rank = np.argsort(-selected_scores_run)
+    for i, idx in enumerate(rank):
+        print(f"      {i+1:2d}. {selected_names_run[idx]:<30s}  F = {selected_scores_run[idx]:>12,.1f}")
+
+    svm_improved = SVC(
+        kernel="rbf", C=1.0, gamma="scale",
+        class_weight="balanced", random_state=seed, max_iter=15000,
+    )
+    m2, pred2 = evaluate(svm_improved, X_train_sel, X_test_sel_run,
+                         y_train, y_test_run, "Phase 2: Improved", seed)
+    all_run_metrics["Phase 2: Improved"].append(m2)
+
+    # ════════════════════════════════════════════════════════════════════
+    # PHASE 3 — OPTIMIZED SVM (GridSearchCV)
+    #   Exhaustive search over C × gamma × kernel with 5-fold
+    #   stratified CV scored by weighted-F1.
+    #
+    #   Search space:
+    #     C      : {0.1, 1, 10, 100}
+    #     gamma  : {scale, auto, 0.01, 0.1}
+    #     kernel : {rbf, poly}
+    #   Total fits: 4 × 4 × 2 × 5 folds = 160 per seed
+    # ════════════════════════════════════════════════════════════════════
+    print(f"\n  PHASE 3 — OPTIMIZED SVM (seed={seed})")
+
+    param_grid = {
+        "C":      [0.1, 1, 10, 100],
+        "gamma":  ["scale", "auto", 0.01, 0.1],
+        "kernel": ["rbf", "poly"],
+    }
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+
+    grid_run = GridSearchCV(
+        estimator=SVC(class_weight="balanced", random_state=seed, max_iter=20000),
+        param_grid=param_grid, cv=cv,
+        scoring="f1_weighted", n_jobs=-1, verbose=1, refit=True,
+    )
+
+    print(f"  Running grid search (32 combos x 5 folds = 160 fits)...")
+    t0 = time.time()
+    grid_run.fit(X_train_sel, y_train)
+    grid_time = time.time() - t0
+
+    print(f"  Grid search completed in {grid_time:.1f}s")
+    print(f"  Best parameters : {grid_run.best_params_}")
+    print(f"  Best CV F1 (wt) : {grid_run.best_score_:.4f}")
+
+    best_model_run = grid_run.best_estimator_
+    pred3 = best_model_run.predict(X_test_sel_run)
+
+    acc3  = accuracy_score(y_test_run, pred3)
+    f1w3  = f1_score(y_test_run, pred3, average="weighted", zero_division=0)
+    f1m3  = f1_score(y_test_run, pred3, average="macro",    zero_division=0)
+    prec3 = precision_score(y_test_run, pred3, average="weighted", zero_division=0)
+    rec3  = recall_score(y_test_run, pred3, average="weighted", zero_division=0)
+
+    print(f"\n  {'─' * 50}")
+    print(f"  Phase 3: Optimized [seed {seed}]")
+    print(f"  {'─' * 50}")
+    print(f"    Accuracy              {acc3:.4f}")
+    print(f"    F1 Score (weighted)   {f1w3:.4f}")
+    print(f"    F1 Score (macro)      {f1m3:.4f}")
+    print(f"    Precision (weighted)  {prec3:.4f}")
+    print(f"    Recall (weighted)     {rec3:.4f}")
+    print(f"    Grid search time      {grid_time:.1f}s")
+    print(f"  {'─' * 50}")
+
+    print("\n  Per-class Classification Report:")
+    print(classification_report(
+        y_test_run, pred3, target_names=le.classes_, zero_division=0
+    ))
+
+    m3 = dict(accuracy=acc3, f1_weighted=f1w3, f1_macro=f1m3,
+              precision=prec3, recall=rec3, time=grid_time)
+    all_run_metrics["Phase 3: Optimized"].append(m3)
+
+    # Keep last run's objects for figure generation
+    pred_p1 = pred1
+    pred_p2 = pred2
+    pred_p3 = pred3
+    y_test = y_test_run
+    X_test_sel = X_test_sel_run
+    best_model = best_model_run
+    grid = grid_run
+    selected_names = selected_names_run
+    selected_scores = selected_scores_run
+    selected_mask = selected_mask_run
+
+
+###############################################################################
+#                                                                             #
+#   MULTI-SEED AVERAGED RESULTS                                              #
+#                                                                             #
+#   Compute the mean and standard deviation of each metric across all seeds. #
+#   These averaged results are the final reported numbers.                   #
 #                                                                             #
 ###############################################################################
 
 print("\n" + "=" * 72)
-print("  PHASE 1 — BASELINE SVM")
-print("    Kernel        : linear")
-print("    C             : 1.0 (default)")
-print("    Scaling       : none")
-print("    Class weights : none (uniform)")
+print(f"  AVERAGED RESULTS ACROSS {N_SEEDS} SEEDS: {SEEDS}")
 print("=" * 72)
 
-svm_baseline = SVC(kernel="linear", C=1.0, random_state=42, max_iter=10000)
-pred_p1 = evaluate(svm_baseline, X_train, X_test, y_train, y_test,
-                   "Phase 1: Baseline")
+metric_names = ["accuracy", "f1_weighted", "f1_macro", "precision", "recall"]
 
+# Build the averaged results dict (used by figures and summary table)
+results = {}
+for phase_name in all_run_metrics:
+    runs = all_run_metrics[phase_name]
+    avg = {}
+    for m in metric_names:
+        vals = [r[m] for r in runs]
+        avg[m] = np.mean(vals)
+        avg[f"{m}_std"] = np.std(vals)
+    avg["time"] = np.mean([r["time"] for r in runs])
 
-###############################################################################
-#                                                                             #
-#   SECTION 5 — PHASE 2: IMPROVED SVM                                        #
-#                                                                             #
-#   Four targeted improvements, each addressing a specific Phase-1 weakness: #
-#                                                                             #
-#   ┌─────────────────────────────────────────────────────────────────────┐   #
-#   │  Improvement             │  Addresses                              │   #
-#   ├──────────────────────────┼─────────────────────────────────────────┤   #
-#   │  StandardScaler          │  Feature magnitude imbalance            │   #
-#   │  ANOVA feature selection │  High dimensionality / redundancy       │   #
-#   │  RBF kernel              │  Non-linear class boundaries            │   #
-#   │  class_weight='balanced' │  Class imbalance                        │   #
-#   └─────────────────────────────────────────────────────────────────────┘   #
-#                                                                             #
-#   DETAILED RATIONALE FOR EACH:                                              #
-#                                                                             #
-#   1) StandardScaler normalisation                                          #
-#      Transforms each feature to zero mean and unit variance:               #
-#        x' = (x - μ) / σ                                                   #
-#      This is CRITICAL for SVMs because:                                    #
-#        - The RBF kernel K(x,x') = exp(-γ||x-x'||²) depends on Euclidean  #
-#          distance — without scaling, high-range features dominate.         #
-#        - Even linear SVMs benefit because the regularisation parameter C   #
-#          applies uniformly across all features.                            #
-#      IMPORTANT: We fit the scaler on training data ONLY and then apply    #
-#      the same transformation to the test set, preventing data leakage.    #
-#                                                                             #
-#   2) ANOVA F-test feature selection (k=30 out of 79)                      #
-#      The F-statistic measures the ratio of between-class variance to       #
-#      within-class variance for each feature.  High F → the feature's      #
-#      values differ significantly across classes → more discriminative.     #
-#      Benefits of reducing from 79 to 30 features:                         #
-#        - Removes noisy / constant / redundant features                    #
-#        - Reduces training time (SVM is O(n² × d))                        #
-#        - Can improve generalisation by limiting overfitting               #
-#                                                                             #
-#   3) RBF (Radial Basis Function) kernel                                   #
-#      Implicitly maps data into an infinite-dimensional feature space via   #
-#        K(x,x') = exp(-γ||x-x'||²)                                       #
-#      This lets the SVM fit non-linear decision boundaries — essential     #
-#      for separating attack types whose feature distributions overlap.     #
-#                                                                             #
-#   4) class_weight='balanced'                                              #
-#      Sets per-class sample weights inversely proportional to frequency:   #
-#        w_j = n_samples / (n_classes × n_j)                               #
-#      Effect: a MITM sample (26 total) is weighted ~374× more than a       #
-#      portscan sample (9710 total), forcing the model to learn minority    #
-#      class patterns instead of ignoring them.                             #
-#                                                                             #
-###############################################################################
+    print(f"\n  {'─' * 60}")
+    print(f"  {phase_name}  (mean ± std over {N_SEEDS} runs)")
+    print(f"  {'─' * 60}")
+    for m in metric_names:
+        print(f"    {m:<22s}  {avg[m]:.4f} ± {avg[f'{m}_std']:.4f}")
+    print(f"    {'time':<22s}  {avg['time']:.2f}s")
+    print(f"  {'─' * 60}")
 
-print("\n" + "=" * 72)
-print("  PHASE 2 — IMPROVED SVM")
-print("    + StandardScaler normalisation")
-print("    + ANOVA F-test feature selection (k=30)")
-print("    + RBF kernel  (non-linear boundaries)")
-print("    + class_weight='balanced'")
-print("=" * 72)
+    results[phase_name] = avg
 
-# ── Step 2a: Feature Scaling ─────────────────────────────────────────────
-# fit_transform() on training data learns μ and σ per feature.
-# transform() on test data uses the SAME μ and σ (no leakage).
-scaler = StandardScaler()
-X_train_sc = scaler.fit_transform(X_train)
-X_test_sc  = scaler.transform(X_test)
-print("  Applied StandardScaler (fit on train, transform both sets)")
+# Attach last run's predictions to results for figure generation
+results["Phase 1: Baseline"]["y_pred"]  = pred_p1
+results["Phase 2: Improved"]["y_pred"]  = pred_p2
+results["Phase 3: Optimized"]["y_pred"] = pred_p3
 
-# ── Step 2b: Feature Selection ───────────────────────────────────────────
-# SelectKBest picks the k features with the highest ANOVA F-scores.
-selector = SelectKBest(f_classif, k=30)
-X_train_sel = selector.fit_transform(X_train_sc, y_train)
-X_test_sel  = selector.transform(X_test_sc)
-
-# Record which features were selected (for reporting and figures)
-selected_mask   = selector.get_support()
-selected_names  = X.columns[selected_mask].tolist()
-selected_scores = selector.scores_[selected_mask]
-
-print(f"  Selected top 30 features by ANOVA F-score:")
-rank = np.argsort(-selected_scores)
-for i, idx in enumerate(rank):
-    print(f"      {i+1:2d}. {selected_names[idx]:<30s}  F = {selected_scores[idx]:>12,.1f}")
-
-# ── Step 2c: Train Improved Model ────────────────────────────────────────
-svm_improved = SVC(
-    kernel="rbf",
-    C=1.0,
-    gamma="scale",              # gamma = 1 / (n_features × Var(X))
-    class_weight="balanced",    # up-weight minority classes
-    random_state=42,
-    max_iter=15000,
-)
-pred_p2 = evaluate(svm_improved, X_train_sel, X_test_sel, y_train, y_test,
-                   "Phase 2: Improved")
+# ── Per-seed summary table ───────────────────────────────────────────────
+print(f"\n  Per-seed breakdown:")
+for phase_name in all_run_metrics:
+    print(f"\n  {phase_name}:")
+    print(f"    {'Seed':<8s}  {'Accuracy':>10s}  {'F1(wt)':>10s}  {'F1(macro)':>10s}  {'Precision':>10s}  {'Recall':>10s}")
+    print(f"    {'─' * 62}")
+    for seed, run in zip(SEEDS, all_run_metrics[phase_name]):
+        print(f"    {seed:<8d}  {run['accuracy']:>10.4f}  {run['f1_weighted']:>10.4f}  "
+              f"{run['f1_macro']:>10.4f}  {run['precision']:>10.4f}  {run['recall']:>10.4f}")
+    avgs = [np.mean([r[m] for r in all_run_metrics[phase_name]]) for m in metric_names]
+    print(f"    {'AVERAGE':<8s}  {avgs[0]:>10.4f}  {avgs[1]:>10.4f}  {avgs[2]:>10.4f}  {avgs[3]:>10.4f}  {avgs[4]:>10.4f}")
 
 
 # REPORT USAGE — Figure 4: Feature Importance (ANOVA F-Scores)
@@ -524,112 +622,14 @@ print("  Saved fig04_feature_importance.png")
 
 ###############################################################################
 #                                                                             #
-#   SECTION 6 — PHASE 3: OPTIMIZED SVM (GridSearchCV)                        #
-#                                                                             #
-#   Phase 2 used reasonable defaults (C=1.0, gamma='scale').  Phase 3        #
-#   systematically searches for the best hyperparameter combination.         #
-#                                                                             #
-#   ┌─────────────────┬─────────────────────┬─────────────────────────────┐   #
-#   │  Hyperparameter  │  Search Space        │  Role                      │   #
-#   ├─────────────────┼─────────────────────┼─────────────────────────────┤   #
-#   │  C               │  {0.1, 1, 10, 100}  │  Regularisation strength.  │   #
-#   │                  │                     │  Small C → wide margin,    │   #
-#   │                  │                     │  more misclassifications.   │   #
-#   │                  │                     │  Large C → narrow margin,  │   #
-#   │                  │                     │  fewer misclassifications. │   #
-#   ├─────────────────┼─────────────────────┼─────────────────────────────┤   #
-#   │  gamma           │  {scale, auto,      │  RBF bandwidth.            │   #
-#   │                  │   0.01, 0.1}        │  Small γ → smooth, simple │   #
-#   │                  │                     │  boundaries.  Large γ →   │   #
-#   │                  │                     │  tight, complex boundaries.│   #
-#   ├─────────────────┼─────────────────────┼─────────────────────────────┤   #
-#   │  kernel          │  {rbf, poly}        │  Decision boundary shape.  │   #
-#   └─────────────────┴─────────────────────┴─────────────────────────────┘   #
-#                                                                             #
-#   Evaluation strategy:                                                      #
-#     • 5-fold Stratified K-Fold cross-validation                            #
-#       - Each fold preserves class proportions                              #
-#     • Scoring metric: weighted-F1                                          #
-#       - Accounts for class imbalance during model selection               #
-#     • Total fits: 4 × 4 × 2 kernels × 5 folds = 160                     #
-#     • refit=True: best model is re-trained on the full training set       #
-#                                                                             #
-###############################################################################
-
-print("\n" + "=" * 72)
-print("  PHASE 3 — OPTIMIZED SVM (GridSearchCV)")
-print("    + 5-fold stratified cross-validation")
-print("    + Grid: C x gamma x kernel (4 x 4 x 2 = 32 combos)")
-print("    + Scoring = weighted F1")
-print("    + class_weight='balanced'")
-print("=" * 72)
-
-param_grid = {
-    "C":      [0.1, 1, 10, 100],
-    "gamma":  ["scale", "auto", 0.01, 0.1],
-    "kernel": ["rbf", "poly"],
-}
-
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-grid = GridSearchCV(
-    estimator=SVC(class_weight="balanced", random_state=42, max_iter=20000),
-    param_grid=param_grid,
-    cv=cv,
-    scoring="f1_weighted",
-    n_jobs=-1,       # use all available CPU cores
-    verbose=1,
-    refit=True,      # refit best model on full training set
-)
-
-print("\n  Running grid search (32 combos x 5 folds = 160 fits)...")
-t0 = time.time()
-grid.fit(X_train_sel, y_train)
-grid_time = time.time() - t0
-
-print(f"\n  Grid search completed in {grid_time:.1f}s")
-print(f"  Best parameters : {grid.best_params_}")
-print(f"  Best CV F1 (wt) : {grid.best_score_:.4f}")
-
-# Evaluate the best estimator on the held-out test set
-best_model = grid.best_estimator_
-pred_p3 = best_model.predict(X_test_sel)
-
-acc3  = accuracy_score(y_test, pred_p3)
-f1w3  = f1_score(y_test, pred_p3, average="weighted", zero_division=0)
-f1m3  = f1_score(y_test, pred_p3, average="macro",    zero_division=0)
-prec3 = precision_score(y_test, pred_p3, average="weighted", zero_division=0)
-rec3  = recall_score(y_test, pred_p3, average="weighted", zero_division=0)
-
-print(f"\n  {'─' * 50}")
-print(f"  Phase 3: Optimized")
-print(f"  {'─' * 50}")
-print(f"    Accuracy              {acc3:.4f}")
-print(f"    F1 Score (weighted)   {f1w3:.4f}")
-print(f"    F1 Score (macro)      {f1m3:.4f}")
-print(f"    Precision (weighted)  {prec3:.4f}")
-print(f"    Recall (weighted)     {rec3:.4f}")
-print(f"    Grid search time      {grid_time:.1f}s")
-print(f"  {'─' * 50}")
-
-print("\n  Per-class Classification Report:")
-print(classification_report(
-    y_test, pred_p3, target_names=le.classes_, zero_division=0
-))
-
-results["Phase 3: Optimized"] = dict(
-    accuracy=acc3, f1_weighted=f1w3, f1_macro=f1m3,
-    precision=prec3, recall=rec3, time=grid_time, y_pred=pred_p3,
-)
-
-
-###############################################################################
-#                                                                             #
 #   SECTION 7 — REPORT-READY VISUALISATIONS                                  #
 #                                                                             #
 #   All figures are saved at 300 dpi with tight bounding boxes, suitable     #
 #   for direct insertion into a Word/LaTeX report.  Each figure has a        #
 #   REPORT USAGE comment explaining what it shows and how to discuss it.     #
+#                                                                             #
+#   NOTE: Figures use the AVERAGED metrics for bar charts and trajectories,  #
+#   and the LAST seed's predictions for confusion matrices and PCA scatter.  #
 #                                                                             #
 ###############################################################################
 
@@ -869,20 +869,21 @@ print("\n" + "=" * 72)
 print("  FINAL IMPROVEMENT SUMMARY")
 print("=" * 72)
 
-# ── Summary Table ────────────────────────────────────────────────────────
+# ── Summary Table (AVERAGED across seeds) ────────────────────────────────
 summary = pd.DataFrame({
-    p: {k: v for k, v in m.items() if k != "y_pred"}
+    p: {k: v for k, v in m.items() if k != "y_pred" and not k.endswith("_std")}
     for p, m in results.items()
 }).T
 summary.index.name = "Phase"
 
-print("\n" + summary.to_string(float_format="{:.4f}".format))
+print(f"\n  Averaged metrics across {N_SEEDS} seeds: {SEEDS}\n")
+print(summary.to_string(float_format="{:.4f}".format))
 
-# ── Improvement Deltas (Baseline → Optimized) ───────────────────────────
+# ── Improvement Deltas (Baseline → Optimized, averaged) ─────────────────
 baseline  = results["Phase 1: Baseline"]
 optimized = results["Phase 3: Optimized"]
 
-print(f"\n  Improvement from Baseline to Optimized:")
+print(f"\n  Improvement from Baseline to Optimized (averaged):")
 print(f"  {'Metric':<20s}  {'Baseline':>10s}  {'Optimized':>10s}  {'Delta':>10s}  {'% Change':>10s}")
 print(f"  {'─' * 65}")
 for m in ["accuracy", "f1_macro", "f1_weighted", "precision", "recall"]:
